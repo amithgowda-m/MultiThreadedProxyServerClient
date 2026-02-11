@@ -20,9 +20,10 @@
 #define MAX_BYTES 4096          
 #define MAX_CLIENTS 400         
 #define LOCK_FILE "server.log"
-#define BLOCKED_FILE "blocked.txt"
+#define MAX_RULES 100           // Max lines per config file
+#define MAX_RULE_LEN 100        // Max length of a rule
 
-// ANSI Colors for Terminal
+// ANSI Colors
 #define GREEN "\033[0;32m"
 #define RED "\033[0;31m"
 #define CYAN "\033[0;36m"
@@ -30,8 +31,6 @@
 #define MAGENTA "\033[0;35m"
 #define RESET "\033[0m"
 
-// [OS CONCEPT] Process Scheduling / Sleep
-// We use usleep() to voluntarily yield CPU time to simulate throttling
 #define THROTTLE_DELAY_US 100000 
 
 typedef struct ParsedRequest ParsedRequest;
@@ -45,21 +44,30 @@ struct cache_element {
     cache_element* next;
 };
 
-// [OS CONCEPT] Global Shared Resources
-// These require synchronization (Locks) to prevent Race Conditions
-const char *blocked_extensions[] = { ".exe", ".sh", ".bat", ".bin", ".tar.gz", NULL };
-const char *throttled_domains[] = { "googlevideo.com", "netflix.com", "fbcdn.net", NULL };
-const char *waf_signatures[] = { "union select", "<script>", "alert(", "../", "/etc/passwd", "drop table", NULL };
+// [DYNAMIC CONFIG] Global Arrays to hold rules
+char blocked_domains[MAX_RULES][MAX_RULE_LEN];
+int blocked_count = 0;
+
+char waf_signatures[MAX_RULES][MAX_RULE_LEN];
+int waf_count = 0;
+
+char dlp_extensions[MAX_RULES][MAX_RULE_LEN];
+int dlp_count = 0;
+
+char qos_domains[MAX_RULES][MAX_RULE_LEN];
+int qos_count = 0;
 
 // --- Function Prototypes ---
+void load_configs(); // [NEW] Loads all txt files
 cache_element* find(char* url);
 int add_cache_element(char* data, int size, char* url);
 void remove_cache_element();
 void log_event(char* client_ip, char* url, char* event, char* color);
+void url_decode(char* src, char* dest);
 int inspect_waf(char* url);
 int inspect_dlp(char* url); 
 int check_qos_throttle(char* host); 
-int check_blacklist(char* hostname); // [RESTORED]
+int check_blacklist(char* hostname);
 int handle_request(int clientSocket, ParsedRequest *request, char *tempReq, char* client_ip);
 int handle_https_request(int clientSocket, ParsedRequest *request, char* client_ip);
 int connectRemoteServer(char* host_addr, int port_num);
@@ -67,44 +75,83 @@ int connectRemoteServer(char* host_addr, int port_num);
 // --- Global Variables ---
 int port_number = 8080;
 pthread_t tid[MAX_CLIENTS];
-
-// [OS CONCEPT] Synchronization Primitives
-sem_t seamaphore;           // Controls max active threads (Concurrency Limit)
-pthread_mutex_t lock;       // Protects the Cache (Critical Section)
-pthread_mutex_t log_lock;   // Protects the Log File (I/O Safety)
+sem_t seamaphore;
+pthread_mutex_t lock;       
+pthread_mutex_t log_lock;   
 
 cache_element* head;
 int cache_size = 0;
 
-// [OS CONCEPT] Memory Management Limits
-#define MAX_SIZE 200*(1<<20)        // 200MB Cache
-#define MAX_ELEMENT_SIZE 10*(1<<20) // 10MB Max File
+#define MAX_SIZE 200*(1<<20)
+#define MAX_ELEMENT_SIZE 10*(1<<20)
 
 // --- Helper Functions ---
 
-int check_blacklist(char* hostname) {
-    // [OS CONCEPT] File I/O
-    FILE *fp = fopen(BLOCKED_FILE, "r");
-    if (!fp) return 0;
-    char line[256];
+// [NEW] Configuration Loader
+void load_file_to_array(char* filename, char array[MAX_RULES][MAX_RULE_LEN], int* count) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        printf("%s[WARNING] Could not open %s. Creating empty file.%s\n", YELLOW, filename, RESET);
+        fp = fopen(filename, "w"); // Create if missing
+        fclose(fp);
+        return;
+    }
+    char line[MAX_RULE_LEN];
+    *count = 0;
     while (fgets(line, sizeof(line), fp)) {
-        line[strcspn(line, "\r\n")] = 0; 
-        if (strlen(line) > 0 && strstr(hostname, line) != NULL) {
-            fclose(fp);
-            return 1; // Blocked!
+        line[strcspn(line, "\r\n")] = 0; // Strip newline
+        if (strlen(line) > 1 && *count < MAX_RULES) {
+            strcpy(array[*count], line);
+            (*count)++;
         }
     }
     fclose(fp);
+    printf("Loaded %d rules from %s\n", *count, filename);
+}
+
+void load_configs() {
+    printf("\n%s--- LOADING CONFIGURATION ---%s\n", CYAN, RESET);
+    load_file_to_array("blocked.txt", blocked_domains, &blocked_count);
+    load_file_to_array("waf_rules.txt", waf_signatures, &waf_count);
+    load_file_to_array("dlp_rules.txt", dlp_extensions, &dlp_count);
+    load_file_to_array("qos_rules.txt", qos_domains, &qos_count);
+    printf("%s--- CONFIGURATION LOADED ---%s\n\n", CYAN, RESET);
+}
+
+void url_decode(char* src, char* dest) {
+    char *p = src;
+    char code[3] = {0};
+    unsigned long val;
+    while(*p) {
+        if(*p == '%') {
+            memcpy(code, ++p, 2);
+            val = strtoul(code, NULL, 16);
+            *dest++ = (char)val;
+            p += 2;
+        } else if(*p == '+') {
+            *dest++ = ' ';
+            p++;
+        } else {
+            *dest++ = *p++;
+        }
+    }
+    *dest = '\0';
+}
+
+int check_blacklist(char* hostname) {
+    for (int i = 0; i < blocked_count; i++) {
+        if (strstr(hostname, blocked_domains[i]) != NULL) return 1;
+    }
     return 0;
 }
 
 int inspect_dlp(char* url) {
     if (url == NULL) return 0;
     int len = strlen(url);
-    for (int i = 0; blocked_extensions[i] != NULL; i++) {
-        int ext_len = strlen(blocked_extensions[i]);
+    for (int i = 0; i < dlp_count; i++) {
+        int ext_len = strlen(dlp_extensions[i]);
         if (len > ext_len) {
-            if (strcasecmp(url + len - ext_len, blocked_extensions[i]) == 0) return 1; 
+            if (strcasecmp(url + len - ext_len, dlp_extensions[i]) == 0) return 1; 
         }
     }
     return 0;
@@ -112,20 +159,25 @@ int inspect_dlp(char* url) {
 
 int check_qos_throttle(char* host) {
     if (host == NULL) return 0;
-    for (int i = 0; throttled_domains[i] != NULL; i++) {
-        if (strstr(host, throttled_domains[i]) != NULL) return 1; 
+    for (int i = 0; i < qos_count; i++) {
+        if (strstr(host, qos_domains[i]) != NULL) return 1; 
     }
     return 0;
 }
 
 int inspect_waf(char* url) {
     if (url == NULL) return 0;
+    
+    char decoded_url[MAX_BYTES];
+    url_decode(url, decoded_url);
+    
     char lower_url[MAX_BYTES];
-    int len = strlen(url);
+    int len = strlen(decoded_url);
     if (len >= MAX_BYTES) len = MAX_BYTES - 1;
-    for(int i = 0; i < len; i++) lower_url[i] = tolower(url[i]);
+    for(int i = 0; i < len; i++) lower_url[i] = tolower(decoded_url[i]);
     lower_url[len] = '\0';
-    for (int i = 0; waf_signatures[i] != NULL; i++) {
+    
+    for (int i = 0; i < waf_count; i++) {
         if (strstr(lower_url, waf_signatures[i]) != NULL) return 1;
     }
     return 0;
@@ -133,9 +185,6 @@ int inspect_waf(char* url) {
 
 void log_event(char* client_ip, char* url, char* event, char* color) {
     printf("%s[%s] %s | %s%s\n", color, event, client_ip, url, RESET);
-    
-    // [OS CONCEPT] Mutual Exclusion (Mutex)
-    // Only one thread can write to the file at a time
     pthread_mutex_lock(&log_lock);
     FILE *fp = fopen(LOCK_FILE, "a");
     if (fp) {
@@ -159,7 +208,6 @@ int sendErrorMessage(int socket, int status_code, char* msg) {
 }
 
 int connectRemoteServer(char* host_addr, int port_num) {
-    // [OS CONCEPT] Sockets (IPC)
     int remoteSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (remoteSocket < 0) return -1;
     struct hostent *host = gethostbyname(host_addr);    
@@ -187,8 +235,6 @@ int handle_https_request(int clientSocket, ParsedRequest *request, char* client_
     int throttle = check_qos_throttle(request->host);
     if (throttle) log_event(client_ip, request->host, "QoS THROTTLING", MAGENTA);
 
-    // [OS CONCEPT] I/O Multiplexing (select)
-    // Monitors multiple file descriptors to see if they are ready for reading
     fd_set readfds;
     int max_fd = (clientSocket > remoteSocketID) ? clientSocket : remoteSocketID;
 
@@ -197,7 +243,6 @@ int handle_https_request(int clientSocket, ParsedRequest *request, char* client_
         FD_SET(clientSocket, &readfds);
         FD_SET(remoteSocketID, &readfds);
         
-        // This blocks the thread until data is available on either socket
         if(select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0) break;
         
         if(FD_ISSET(clientSocket, &readfds)) {
@@ -210,8 +255,6 @@ int handle_https_request(int clientSocket, ParsedRequest *request, char* client_
             int len = recv(remoteSocketID, buf, MAX_BYTES, 0);
             if(len <= 0) break;
             send(clientSocket, buf, len, 0);
-            
-            // [OS CONCEPT] Context Switching / Sleep
             if (throttle) usleep(THROTTLE_DELAY_US); 
         }
     }
@@ -262,14 +305,10 @@ int handle_request(int clientSocket, ParsedRequest *request, char *tempReq, char
     return 0;
 }
 
-// [OS CONCEPT] Thread Function
 void* thread_fn(void* socketNew) {
-    // [OS CONCEPT] Semaphores
-    // Wait operation decrements semaphore; blocks if value is 0
     sem_wait(&seamaphore); 
-    
     int socket = *(int*)socketNew;
-    free(socketNew); // Free heap memory allocated in main
+    free(socketNew); 
     
     struct sockaddr_in addr;
     socklen_t addr_size = sizeof(struct sockaddr_in);
@@ -283,33 +322,28 @@ void* thread_fn(void* socketNew) {
     struct ParsedRequest* request = ParsedRequest_create();
     if (len > 0 && ParsedRequest_parse(request, buffer, len) >= 0) {
         
-        // 1. [RESTORED] Block List Check
         if (request->host && check_blacklist(request->host)) {
             log_event(client_ip, request->host, "BLACKLIST BLOCKED", RED);
             sendErrorMessage(socket, 403, "Access Denied: Domain is Blacklisted");
             goto cleanup;
         }
 
-        // 2. DLP: File Extension Blocking
         if (request->path && inspect_dlp(request->path)) {
             log_event(client_ip, request->path, "DLP BLOCK (.exe/.sh)", RED);
             sendErrorMessage(socket, 403, "File Download Blocked by IT Policy");
             goto cleanup;
         }
 
-        // 3. WAF: Security Inspection
         if ((request->host && inspect_waf(request->host)) || (request->path && inspect_waf(request->path))) {
             log_event(client_ip, request->host, "WAF BLOCK (Attack)", RED);
             sendErrorMessage(socket, 403, "Malicious Request Detected");
             goto cleanup;
         }
 
-        // 4. HTTPS Tunneling
         if (strcmp(request->method, "CONNECT") == 0) {
             log_event(client_ip, request->host, "HTTPS TUNNEL", GREEN);
             handle_https_request(socket, request, client_ip); 
         } else {
-            // 5. Caching (Reader/Writer Problem simplified)
             char *tempReq = (char*)malloc(strlen(buffer)+1);
             strcpy(tempReq, buffer);
             struct cache_element* temp = find(tempReq);
@@ -329,9 +363,6 @@ cleanup:
     shutdown(socket, SHUT_RDWR);
     close(socket);
     free(buffer);
-    
-    // [OS CONCEPT] Semaphores
-    // Signal operation increments semaphore; wakes up blocked threads
     sem_post(&seamaphore);
     return NULL;
 }
@@ -341,19 +372,19 @@ int main(int argc, char * argv[]) {
     struct sockaddr_in server_addr, client_addr; 
     socklen_t client_len;
 
-    // [OS CONCEPT] Initialization of Sync Primitives
     sem_init(&seamaphore, 0, MAX_CLIENTS); 
     pthread_mutex_init(&lock, NULL); 
     pthread_mutex_init(&log_lock, NULL); 
 
+    // [NEW] Load Rules at Startup
+    load_configs(); 
+
     if (argc == 2) port_number = atoi(argv[1]);
     else { printf("Usage: ./proxy <port>\n"); exit(1); }
 
-    printf("\n%s OS FINAL PROXY SERVER STARTED ON %d%s\n", CYAN, port_number, RESET);
-    printf("%s LAYER 1: BLACKLIST ENABLED%s\n", RED, RESET);
-    printf("%s LAYER 2: WAF & DLP ACTIVE%s\n", GREEN, RESET);
-    printf("%s LAYER 3: QoS TRAFFIC SHAPING ACTIVE%s\n\n", MAGENTA, RESET);
-
+    printf("\n%sENTERPRISE PROXY SERVER STARTED ON %d%s\n", CYAN, port_number, RESET);
+    printf("%sWAF, DLP, BLACKLIST: LOADED FROM FILES%s\n", GREEN, RESET);
+    
     int proxy_socketId = socket(AF_INET, SOCK_STREAM, 0);
     int reuse = 1;
     setsockopt(proxy_socketId, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -368,14 +399,8 @@ int main(int argc, char * argv[]) {
         client_len = sizeof(client_addr); 
         client_socketId = accept(proxy_socketId, (struct sockaddr*)&client_addr, &client_len);
         if (client_socketId < 0) continue;
-        
-        // [OS CONCEPT] Heap Memory Allocation
-        // Allocate memory for socket ID to pass to thread safely
         int *client_sock_ptr = malloc(sizeof(int));
         *client_sock_ptr = client_socketId;
-        
-        // [OS CONCEPT] Multithreading
-        // Create a new thread for every client connection
         pthread_create(&tid[i++], NULL, thread_fn, (void*)client_sock_ptr); 
     }
     return 0;
@@ -384,7 +409,7 @@ int main(int argc, char * argv[]) {
 // --- Cache Implementation (Unchanged) ---
 cache_element* find(char* url) {
     cache_element* site = NULL;
-    pthread_mutex_lock(&lock); // Critical Section Entry
+    pthread_mutex_lock(&lock);
     if (head != NULL) {
         site = head;
         while (site != NULL) {
@@ -395,7 +420,7 @@ cache_element* find(char* url) {
             site = site->next;
         }       
     }
-    pthread_mutex_unlock(&lock); // Critical Section Exit
+    pthread_mutex_unlock(&lock);
     return site;
 }
 

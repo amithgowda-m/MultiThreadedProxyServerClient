@@ -1,0 +1,6 @@
+.exe
+.sh
+.bat
+.bin
+.tar.gz
+.iso
