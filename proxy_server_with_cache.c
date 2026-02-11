@@ -349,10 +349,10 @@ int main(int argc, char * argv[]) {
     if (argc == 2) port_number = atoi(argv[1]);
     else { printf("Usage: ./proxy <port>\n"); exit(1); }
 
-    printf("\n%s🏢 OS FINAL PROXY SERVER STARTED ON %d%s\n", CYAN, port_number, RESET);
-    printf("%s🛑 LAYER 1: BLACKLIST ENABLED%s\n", RED, RESET);
-    printf("%s🛡️  LAYER 2: WAF & DLP ACTIVE%s\n", GREEN, RESET);
-    printf("%s📉 LAYER 3: QoS TRAFFIC SHAPING ACTIVE%s\n\n", MAGENTA, RESET);
+    printf("\n%s OS FINAL PROXY SERVER STARTED ON %d%s\n", CYAN, port_number, RESET);
+    printf("%s LAYER 1: BLACKLIST ENABLED%s\n", RED, RESET);
+    printf("%s LAYER 2: WAF & DLP ACTIVE%s\n", GREEN, RESET);
+    printf("%s LAYER 3: QoS TRAFFIC SHAPING ACTIVE%s\n\n", MAGENTA, RESET);
 
     int proxy_socketId = socket(AF_INET, SOCK_STREAM, 0);
     int reuse = 1;
